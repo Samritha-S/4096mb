@@ -12,6 +12,7 @@ Features:
 
 import hashlib
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -19,12 +20,21 @@ import sys
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Union
 
+logger = logging.getLogger(__name__)
+
 # Ensure paths are configured for both direct execution and package imports
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
 for p in (CURRENT_DIR, PARENT_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(PARENT_DIR, ".env"))
+    load_dotenv()  # also check current dir
+except ImportError:
+    pass
 
 try:
     # pyrefly: ignore [missing-import]
@@ -85,9 +95,15 @@ class SearchResult:
 
 
 def _pure_cosine_similarity(query_vec: List[float], doc_vec: List[float]) -> float:
-    """Pure Python cosine similarity between two 1D vectors."""
+    """Pure Python cosine similarity between two 1D vectors with strict dimension validation."""
     if not query_vec or not doc_vec:
         return 0.0
+    if len(query_vec) != len(doc_vec):
+        raise ValueError(
+            f"Vector dimension mismatch: query vector has {len(query_vec)} dimensions, "
+            f"but document vector has {len(doc_vec)} dimensions. "
+            f"Both vectors must be embedded using the exact same model and backend."
+        )
     dot = sum(q * d for q, d in zip(query_vec, doc_vec))
     q_norm = math.sqrt(sum(q * q for q in query_vec))
     d_norm = math.sqrt(sum(d * d for d in doc_vec))
@@ -100,25 +116,30 @@ def cosine_similarity(query_vec: Any, doc_vecs: Any) -> Any:
     """
     Compute cosine similarity between a 1D query vector and doc vectors.
     Supports both Numpy ndarray and pure Python lists.
+    Validates that vector dimensions strictly match.
     """
     if HAS_NUMPY and np is not None:
-        try:
-            q = np.array(query_vec, dtype=np.float32)
-            docs = np.array(doc_vecs, dtype=np.float32)
-            if docs.ndim == 1:
-                docs = docs.reshape(1, -1)
+        q = np.array(query_vec, dtype=np.float32)
+        docs = np.array(doc_vecs, dtype=np.float32)
+        if docs.ndim == 1:
+            docs = docs.reshape(1, -1)
 
-            query_norm = np.linalg.norm(q)
-            if query_norm == 0:
-                return np.zeros(docs.shape[0])
+        if q.shape[0] != docs.shape[1]:
+            raise ValueError(
+                f"Vector dimension mismatch: query vector has {q.shape[0]} dimensions, "
+                f"but document vector has {docs.shape[1]} dimensions. "
+                f"Both vectors must be embedded using the exact same model and backend."
+            )
 
-            doc_norms = np.linalg.norm(docs, axis=1)
-            doc_norms[doc_norms == 0] = 1e-10
+        query_norm = np.linalg.norm(q)
+        if query_norm == 0:
+            return np.zeros(docs.shape[0])
 
-            dot_products = np.dot(docs, q)
-            return dot_products / (doc_norms * query_norm)
-        except Exception:
-            pass
+        doc_norms = np.linalg.norm(docs, axis=1)
+        doc_norms[doc_norms == 0] = 1e-10
+
+        dot_products = np.dot(docs, q)
+        return dot_products / (doc_norms * query_norm)
 
     # Pure Python fallback
     if isinstance(doc_vecs, list) and len(doc_vecs) > 0 and isinstance(doc_vecs[0], (int, float)):
@@ -127,11 +148,17 @@ def cosine_similarity(query_vec: Any, doc_vecs: Any) -> Any:
 
 
 class EmbeddingProvider:
-    """Generates embeddings using Google Gemini API or deterministic offline fallback."""
+    """Generates embeddings aligned with Person 1's active model and backend."""
 
-    def __init__(self, api_key: Optional[str] = None, model_name: str = "models/text-embedding-004"):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model_name: Optional[str] = None,
+        backend: Optional[str] = None,
+    ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        self.model_name = model_name
+        self.backend = backend or os.getenv("EMBEDDING_BACKEND", "gemini")
+        self.model_name = model_name or os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-2")
         self._client = None
         self._init_client()
 
@@ -146,8 +173,16 @@ class EmbeddingProvider:
                 self._client = None
 
     def embed_text(self, text: str) -> List[float]:
-        """Generate embedding vector for a single string."""
-        if self._client:
+        """Generate embedding vector for a single query string."""
+        # 1. Primary path: Use Person 1's embed_query for 100% byte-for-byte vector space consistency
+        try:
+            from embedder import embed_query
+            return embed_query(text, backend=self.backend)
+        except Exception as exc:
+            logger.debug("Primary embed_query failed: %s; trying secondary path", exc)
+
+        # 2. Secondary path: Use Google GenAI SDK if initialized
+        if self._client and self.backend == "gemini":
             try:
                 result = self._client.embed_content(
                     model=self.model_name,
@@ -155,26 +190,26 @@ class EmbeddingProvider:
                     task_type="retrieval_query"
                 )
                 return result["embedding"]
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Secondary genai SDK embed failed: %s", exc)
 
-        return self._generate_deterministic_embedding(text)
+        # 3. Offline / fallback deterministic embedding matching active model dimensions
+        dim = 384 if self.backend == "local" else 3072
+        logger.warning(
+            "Generating deterministic fallback embedding (dim=%d) for query. "
+            "Set GEMINI_API_KEY to enable neural semantic embeddings.", dim
+        )
+        return self._generate_deterministic_embedding(text, dim=dim)
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings for multiple strings."""
         return [self.embed_text(t) for t in texts]
 
     @staticmethod
-    def _generate_deterministic_embedding(text: str, dim: int = 128) -> List[float]:
+    def _generate_deterministic_embedding(text: str, dim: int = 3072) -> List[float]:
         """
         Deterministic pseudo-embedding for offline development and testing.
-        Uses character n-grams and hashing to produce consistent similarity for
-        semantic overlap. Uses a stable hash (hashlib-based) rather than the
-        builtin hash(), so results are reproducible across separate Python
-        processes/runs -- important if embeddings are ever persisted to disk
-        and reloaded later (e.g. via StorageLoader.save_to_json /
-        save_to_sqlite) and compared against embeddings computed in a fresh
-        process.
+        Defaults to 3072 dimensions to match Gemini vector dimensions.
         """
         vec = [0.0] * dim
         words = text.lower().split()
@@ -332,14 +367,17 @@ class CodebaseRetriever:
 
         query_vec = self.embedder.embed_text(question)
 
-        # Calculate scores
+        # Calculate scores using vectorized cosine similarity
+        valid_pairs = [(i, c) for i, c in enumerate(self.chunks) if c.embedding is not None]
+        if not valid_pairs:
+            return []
+
+        doc_vecs = [c.embedding for _, c in valid_pairs]
+        scores = cosine_similarity(query_vec, doc_vecs)
+
         scored_items = []
-        for chunk in self.chunks:
-            if chunk.embedding is not None:
-                score = _pure_cosine_similarity(query_vec, chunk.embedding)
-            else:
-                score = 0.0
-            scored_items.append((score, chunk))
+        for (i, chunk), score in zip(valid_pairs, scores):
+            scored_items.append((float(score), chunk))
 
         # Sort descending by score
         scored_items.sort(key=lambda x: x[0], reverse=True)

@@ -51,7 +51,7 @@ python main.py --repo test_repo --single-file test_repo/auth.py
 You'll see:
 - Number of chunks produced
 - A text preview of chunk 0 with its file path and line range
-- Embedding dimension (768 for Gemini text-embedding-004, 384 for local)
+- Embedding dimension (3072 for Gemini gemini-embedding-2 / gemini-embedding-001, 384 for local)
 - `output/chunks.json` written
 
 ### Step 2 — Full test_repo
