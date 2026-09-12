@@ -17,19 +17,16 @@ from chunker import Chunk
 
 logger = logging.getLogger(__name__)
 
-# ── Gemini backend (pure REST — no google-generativeai SDK needed) ────────────
-
-_GEMINI_EMBED_URL = (
+_GEMINI_BATCH_EMBED_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-embedding-001:embedContent"
+    "models/gemini-embedding-001:batchEmbedContents"
 )
 
 
-def _embed_gemini(texts: List[str], api_key: str) -> List[List[float]]:
+def _embed_gemini(texts: List[str], api_key: str, batch_size: int = 20) -> List[List[float]]:
     """
-    Embed texts using the Gemini embedding REST endpoint.
-    Uses `requests` (already installed via langchain) — no extra SDK needed.
-    Retries with exponential back-off on transient errors.
+    Embed texts using the Gemini batchEmbedContents REST endpoint in batches.
+    Handles rate-limiting (429) with exponential back-off up to 30s.
     """
     import requests
     import urllib3
@@ -39,36 +36,55 @@ def _embed_gemini(texts: List[str], api_key: str) -> List[List[float]]:
     session.verify = False  # captive portal injects self-signed cert on this network
     embeddings: List[List[float]] = []
 
-    for i, text in enumerate(texts):
-        payload = {
-            "model": "models/gemini-embedding-001",
-            "content": {"parts": [{"text": text}]},
-            "taskType": "RETRIEVAL_DOCUMENT",
-        }
-        for attempt in range(4):
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start : start + batch_size]
+        requests_payload = [
+            {
+                "model": "models/gemini-embedding-001",
+                "content": {"parts": [{"text": t}]},
+                "taskType": "RETRIEVAL_DOCUMENT",
+            }
+            for t in batch
+        ]
+        payload = {"requests": requests_payload}
+
+        for attempt in range(8):
             try:
                 resp = session.post(
-                    _GEMINI_EMBED_URL,
+                    _GEMINI_BATCH_EMBED_URL,
                     params={"key": api_key},
                     json=payload,
-                    timeout=30,
+                    timeout=60,
                 )
+                if resp.status_code == 429:
+                    wait = min(60, (2 ** attempt) * 2 + 5)
+                    logger.warning(
+                        "Gemini rate limit (429) on batch [%d:%d], attempt %d/8 — sleeping %ds for quota recovery",
+                        start, start + len(batch), attempt + 1, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+
                 if not resp.ok:
                     raise ValueError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+
                 data = resp.json()
-                vec = data["embedding"]["values"]
-                embeddings.append(vec)
+                for item in data.get("embeddings", []):
+                    embeddings.append(item["values"])
                 break
             except Exception as exc:
-                wait = 2 ** attempt
+                wait = min(60, 2 ** attempt + 3)
                 logger.warning(
-                    "Gemini embed attempt %d/4 failed for chunk %d: %s — retrying in %ds",
-                    attempt + 1, i, exc, wait,
+                    "Gemini embed attempt %d/8 failed for batch [%d:%d]: %s — retrying in %ds",
+                    attempt + 1, start, start + len(batch), exc, wait,
                 )
                 time.sleep(wait)
         else:
-            logger.error("All retries failed for chunk %d; inserting empty vector.", i)
-            embeddings.append([])
+            logger.error("All retries failed for batch [%d:%d]; inserting empty vectors.", start, start + len(batch))
+            embeddings.extend([[] for _ in batch])
+
+        # Small politeness delay between batches to respect RPM limits
+        time.sleep(0.5)
 
     return embeddings
 

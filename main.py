@@ -95,9 +95,11 @@ class ScanStats:
     skipped_extension: int = 0
     skipped_oversized: int = 0
     skipped_error: int = 0
+    skipped_empty: int = 0
     chunks_codesplitter: int = 0
     chunks_langchain: int = 0
     skip_details: list[tuple[str, str]] = field(default_factory=list)
+    processed_details: list[tuple[str, str, int]] = field(default_factory=list)
 
 
 def walk_repo_with_stats(repo_root: str) -> tuple[List[Path], ScanStats]:
@@ -243,11 +245,20 @@ def run_full(
 
     all_chunks: List[Chunk] = []
     for fpath in tqdm(files, desc="Chunking", unit="file"):
+        rel_fpath = str(fpath.relative_to(Path(repo_root).resolve())).replace("\\", "/")
         chunks, method = chunk_file_with_method(str(fpath), repo_root, chunk_size, chunk_overlap)
-        if method == "codesplitter":
+        if method == "empty":
+            stats.skipped_empty += 1
+            stats.skip_details.append((rel_fpath, "empty or whitespace-only file (0 chunks produced)"))
+        elif method == "error":
+            stats.skipped_error += 1
+            stats.skip_details.append((rel_fpath, "read/decode error"))
+        elif method == "codesplitter":
             stats.chunks_codesplitter += len(chunks)
+            stats.processed_details.append((rel_fpath, "CodeSplitter", len(chunks)))
         else:
             stats.chunks_langchain += len(chunks)
+            stats.processed_details.append((rel_fpath, "Langchain fallback", len(chunks)))
         all_chunks.extend(chunks)
 
     # Print requested comprehensive summary report
@@ -255,11 +266,13 @@ def run_full(
     print("=== REPO SCAN & CHUNKING SUMMARY ===")
     print(f"Repository target:         {repo_root}")
     print(f"Total files scanned:       {stats.total_files_scanned}")
-    print(f"Source files processed:    {stats.total_files_processed}")
     total_skipped = (stats.skipped_binary + stats.skipped_extension +
-                     stats.skipped_oversized + stats.skipped_error)
-    print(f"Files skipped:             {total_skipped}")
+                     stats.skipped_oversized + stats.skipped_error + stats.skipped_empty)
+    active_processed = stats.total_files_processed - stats.skipped_empty
+    print(f"Files processed (chunks > 0): {active_processed}")
+    print(f"Files skipped / 0-chunks:  {total_skipped}")
     print(f"  - Binary (null-byte):    {stats.skipped_binary}")
+    print(f"  - Empty / whitespace:    {stats.skipped_empty}")
     print(f"  - Extension / non-code:  {stats.skipped_extension}")
     print(f"  - Oversized (>512KB):    {stats.skipped_oversized}")
     print(f"  - Read/stat errors:      {stats.skipped_error}")
@@ -268,6 +281,11 @@ def run_full(
     print(f"  - From CodeSplitter:     {stats.chunks_codesplitter}")
     print(f"  - From Langchain fallback: {stats.chunks_langchain}")
     print("=" * 65)
+
+    if stats.processed_details:
+        print("\n--- Processed Files Breakdown ---")
+        for f, meth, count in stats.processed_details:
+            print(f"  ✓ {f} -> {count} chunk(s) via [{meth}]")
 
     if stats.skip_details:
         print("\n--- Skipped Items Details ---")
