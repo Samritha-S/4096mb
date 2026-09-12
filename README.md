@@ -60,57 +60,24 @@ You'll see:
 python main.py --repo test_repo
 ```
 
-### Step 3 — Real demo repo
+### Step 3 — Official Demo Repo (pallets/click)
 
 ```bash
-python main.py --repo /path/to/real/repo
+git clone --depth 1 https://github.com/pallets/click.git click
+python main.py --repo click
 ```
+
+Produces `output/chunks.json` (~764 chunks) ready for Person 2 (retrieval/vector store) and Person 3 (FastAPI/LLM Q&A).
 
 ---
 
-## Backends
+## Benchmark & Performance (Official Demo: click)
 
-| Backend | Env var value | Notes |
-|---------|--------------|-------|
-| Gemini  | `gemini`     | Requires `GEMINI_API_KEY`. Dim=768. Rate-limited; retry built in. |
-| Local   | `local`      | `all-MiniLM-L6-v2` (~90 MB download on first run). Dim=384. Fully offline. |
-
-Switch backends: edit `EMBEDDING_BACKEND` in `.env` or pass `--backend local`.
-
----
-
-## CLI reference
-
-```
-python main.py --repo <path>          # full repo
-               --single-file <path>   # smoke-test mode (one file)
-               --backend gemini|local # override .env
-               --chunk-size N         # lines per chunk (default 512)
-               --chunk-overlap N      # overlap (default 64)
-               --output path/to.json  # override output path
-```
-
----
-
-## Architecture
-
-```
-main.py          ← orchestrator: CLI + repo walk + save
-chunker.py       ← CodeSplitter (tree-sitter) → fallback (langchain)
-embedder.py      ← Gemini embed_content  OR  sentence-transformers
-test_repo/       ← synthetic Python / JS / TS files for validation
-output/          ← chunks.json (gitignored)
-```
-
-### Chunking strategy
-
-1. **Primary** — `llama_index.core.node_parser.CodeSplitter`  
-   Tree-sitter parses the AST; splits happen at function/class boundaries.  
-   Supported: Python, JS, TS, Java, Go, Rust, C/C++.
-
-2. **Fallback** — `langchain_text_splitters.RecursiveCharacterTextSplitter.from_language()`  
-   Language-aware separator list (e.g. `\nclass `, `\ndef `).  
-   Used when a tree-sitter grammar is missing or parse fails.
-
-Line numbers are always computed by binary-searching a character-offset table built from the raw file, so they are accurate regardless of which splitter runs.
->>>>>>> 30dc5d8 (feat(ingestion): tree-sitter CodeSplitter pipeline with Gemini embeddings and repo traversal)
+- **Target**: `pallets/click` (165 scanned files, 137 processed)
+- **Total Chunks**: 764 chunks
+  - 675 via Tree-sitter `CodeSplitter` (Python)
+  - 89 via `langchain_fallback` (Markdown docs, YAML, TOML)
+- **Timing**:
+  - Chunking duration: ~5.2s
+  - Embedding duration: ~820s (~13.7 min on standard Gemini API tier with 429 backoff)
+- **Output**: `output/chunks.json` (locked 5-key schema, 3072-dim embeddings)

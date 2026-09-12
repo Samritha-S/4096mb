@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
@@ -238,11 +239,13 @@ def run_full(
 ) -> None:
     from chunker import chunk_file_with_method
 
+    t0 = time.time()
     files, stats = walk_repo_with_stats(repo_root)
     if not files:
         logger.error("No source files found in %s", repo_root)
         sys.exit(1)
 
+    t_chunk_start = time.time()
     all_chunks: List[Chunk] = []
     for fpath in tqdm(files, desc="Chunking", unit="file"):
         rel_fpath = str(fpath.relative_to(Path(repo_root).resolve())).replace("\\", "/")
@@ -260,6 +263,21 @@ def run_full(
             stats.chunks_langchain += len(chunks)
             stats.processed_details.append((rel_fpath, "Langchain fallback", len(chunks)))
         all_chunks.extend(chunks)
+
+    t_chunk_end = time.time()
+    chunk_time = t_chunk_end - t_chunk_start
+
+    t_embed_start = time.time()
+    if not no_embed:
+        logger.info("Embedding via '%s' backend…", backend)
+        embed_chunks(all_chunks, backend=backend)
+    else:
+        logger.info("--no-embed set: skipping embedding step.")
+    t_embed_end = time.time()
+    embed_time = t_embed_end - t_embed_start
+    total_time = t_embed_end - t0
+
+    save_chunks(all_chunks, output_path)
 
     # Print requested comprehensive summary report
     print("\n" + "=" * 65)
@@ -280,6 +298,11 @@ def run_full(
     print(f"Total chunks produced:     {len(all_chunks)}")
     print(f"  - From CodeSplitter:     {stats.chunks_codesplitter}")
     print(f"  - From Langchain fallback: {stats.chunks_langchain}")
+    print("-" * 65)
+    print("=== PIPELINE TIMING BREAKDOWN ===")
+    print(f"  • Chunking duration:     {chunk_time:.2f}s")
+    print(f"  • Embedding duration:    {embed_time:.2f}s")
+    print(f"  • Total end-to-end time: {total_time:.2f}s ({total_time/60:.2f} min)")
     print("=" * 65)
 
     if stats.processed_details:
@@ -292,16 +315,6 @@ def run_full(
         for item, reason in stats.skip_details:
             print(f"  • {item} -> [{reason}]")
         print("-" * 65 + "\n")
-
-    logger.info("Total chunks before embedding: %d", len(all_chunks))
-
-    if not no_embed:
-        logger.info("Embedding via '%s' backend…", backend)
-        embed_chunks(all_chunks, backend=backend)
-    else:
-        logger.info("--no-embed set: skipping embedding step.")
-
-    save_chunks(all_chunks, output_path)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
