@@ -1,0 +1,65 @@
+{
+  "instruction": "Fix the affected caller payment.py so it works with the new CartTotal return type.",
+  "constraints": [
+    "Do not change the public API of process_payment",
+    "Preserve existing behavior and tax calculations"
+  ],
+  "target_file": "payment.py",
+  "impact_analysis": {
+    "project_id": "demo-project",
+    "change": {
+      "file": "cart.py",
+      "start_line": 42,
+      "end_line": 48,
+      "symbol": "calculate_total",
+      "change_type": "RETURN_TYPE_CHANGE",
+      "description": "Return type changed from dictionary to CartTotal"
+    },
+    "impacted_components": [
+      {
+        "file": "payment.py",
+        "start_line": 87,
+        "end_line": 90,
+        "symbol": "process_payment",
+        "relationship": "calls"
+      }
+    ],
+    "impact_chain": [
+      "cart.py:calculate_total",
+      "payment.py:process_payment",
+      "checkout.py:checkout"
+    ],
+    "evidence": [
+      {
+        "file": "cart.py",
+        "start_line": 42,
+        "end_line": 48,
+        "content": "class CartTotal:\n    def __init__(self, subtotal: float, tax: float):\n        self.subtotal = subtotal\n        self.tax = tax\n\ndef calculate_total(cart):\n    return CartTotal(subtotal, tax)\n",
+        "symbol": "calculate_total"
+      },
+      {
+        "file": "payment.py",
+        "start_line": 87,
+        "end_line": 90,
+        "content": "    total = calculate_total(cart)\n    tax = total['tax']\n    subtotal = total['subtotal']\n",
+        "symbol": "process_payment"
+      }
+    ]
+  },
+  "evidence": [
+    {
+      "file": "cart.py",
+      "start_line": 1,
+      "end_line": 6,
+      "content": "class CartTotal:\n    def __init__(self, subtotal: float, tax: float):\n        self.subtotal = subtotal\n        self.tax = tax\n",
+      "symbol": "CartTotal"
+    },
+    {
+      "file": "payment.py",
+      "start_line": 87,
+      "end_line": 90,
+      "content": "    total = calculate_total(cart)\n    tax = total['tax']\n    subtotal = total['subtotal']\n",
+      "symbol": "process_payment"
+    }
+  ]
+}

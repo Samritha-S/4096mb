@@ -37,10 +37,10 @@ Each item strictly satisfies the 5 locked schema fields:
 > - An empirical dot product of identical text across the two models yields ~0.0018 (essentially random noise).
 > - **DO NOT mix chunks embedded under different Gemini model versions in the same index.**
 > - **Person 2's `/ask` query embedder MUST call the EXACT same model version that was used to produce `output/chunks.json`.**
-> 
+>
 > Currently, `output/chunks.json` for Click (764 chunks) and `output/backup_chunks.json` for itsdangerous (82 chunks) are embedded using:
 > **`models/gemini-embedding-2`** (due to Google's 1,000 req/day cap on v1).
-> 
+>
 > When embedding queries in Person 2/3's retrieval service, specify:
 > `"model": "models/gemini-embedding-2"` and `"taskType": "RETRIEVAL_QUERY"`.
 
@@ -70,7 +70,7 @@ Each item strictly satisfies the 5 locked schema fields:
 ## 4. Known Edge Cases & FAQ for Search/Retrieval Consumers
 
 ### Q: Why are there tiny 1-line chunks like `class Command:` (line 964) in `core.py`?
-**Explanation**: Tree-sitter parses the code as a syntax tree (AST). In Python grammars, `class_definition` contains the class header as an independent node, while inner methods (`__init__`, `invoke`, etc.) are parsed as child AST blocks. When methods exceed the chunk window (~40 lines), CodeSplitter splits at inner method boundaries, leaving the class declaration as an independent semantic header.  
+**Explanation**: Tree-sitter parses the code as a syntax tree (AST). In Python grammars, `class_definition` contains the class header as an independent node, while inner methods (`__init__`, `invoke`, etc.) are parsed as child AST blocks. When methods exceed the chunk window (~40 lines), CodeSplitter splits at inner method boundaries, leaving the class declaration as an independent semantic header.
 **Search Recommendation**: If a query matches a class declaration chunk, Person 2's search ranker can retrieve the subsequent chunk (the primary `__init__` or docstring block) to provide complete context.
 
 ### Q: What about non-UTF-8 or Latin-1 files?
@@ -96,7 +96,7 @@ def search(query_vector: np.ndarray, top_k: int = 5):
     norms = np.linalg.norm(embeddings, axis=1) * np.linalg.norm(query_vector)
     similarities = np.dot(embeddings, query_vector) / np.maximum(norms, 1e-9)
     top_indices = np.argsort(similarities)[::-1][:top_k]
-    
+
     return [{
         "file_path": chunks[i]["file_path"],
         "lines": f"{chunks[i]['start_line']}-{chunks[i]['end_line']}",
@@ -217,4 +217,3 @@ In case the primary `click` target encounters live demonstration issues (network
 - **Person 3 (`/ask`)**: Load from `output/backup_chunks.json` instead of `output/chunks.json`.
 - **Person 3 (`/drift-trend`)**: Read manifest from `output/backup_snapshots/manifest.json`.
 - **Re-run Pipeline**: `python main.py --repo itsdangerous --output output/backup_chunks.json` (takes only 45 seconds).
-

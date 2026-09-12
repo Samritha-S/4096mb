@@ -1,0 +1,44 @@
+{
+  "project_id": "demo-project",
+  "change": {
+    "file": "cart.py",
+    "start_line": 42,
+    "end_line": 48,
+    "symbol": "calculate_total",
+    "change_type": "RETURN_TYPE_CHANGE",
+    "description": "Return type changed from dictionary to CartTotal",
+    "before": "return {'subtotal': subtotal, 'tax': tax}",
+    "after": "return CartTotal(subtotal, tax)"
+  },
+  "impacted_components": [
+    {
+      "file": "payment.py",
+      "start_line": 87,
+      "end_line": 90,
+      "symbol": "process_payment",
+      "relationship": "calls",
+      "details": "Invokes calculate_total and consumes its return value"
+    }
+  ],
+  "impact_chain": [
+    "cart.py:calculate_total",
+    "payment.py:process_payment",
+    "checkout.py:checkout"
+  ],
+  "evidence": [
+    {
+      "file": "cart.py",
+      "start_line": 42,
+      "end_line": 48,
+      "content": "def calculate_total(cart):\n    subtotal = sum(item['price'] for item in cart)\n    tax = round(subtotal * 0.08, 2)\n    return CartTotal(subtotal, tax)\n",
+      "symbol": "calculate_total"
+    },
+    {
+      "file": "payment.py",
+      "start_line": 87,
+      "end_line": 90,
+      "content": "    total = calculate_total(cart)\n    tax = total['tax']\n    subtotal = total['subtotal']\n",
+      "symbol": "process_payment"
+    }
+  ]
+}
