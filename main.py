@@ -310,8 +310,8 @@ def main() -> None:
 
     # Resolve config with env-var defaults
     backend      = args.backend      or os.getenv("EMBEDDING_BACKEND", "gemini")
-    chunk_size   = args.chunk_size   or int(os.getenv("CHUNK_SIZE",   "512"))
-    chunk_overlap= args.chunk_overlap or int(os.getenv("CHUNK_OVERLAP", "64"))
+    chunk_size   = args.chunk_size   or int(os.getenv("CHUNK_SIZE",   "40"))
+    chunk_overlap= args.chunk_overlap or int(os.getenv("CHUNK_OVERLAP", "10"))
     output_dir   = os.getenv("OUTPUT_DIR",  "output")
     output_file  = os.getenv("OUTPUT_FILE", "chunks.json")
     output_path  = args.output or str(Path(output_dir) / output_file)
