@@ -31,15 +31,25 @@ Each item strictly satisfies the 5 locked schema fields:
 
 ## 2. Embedding Model & Vector Space Matching
 
-> [!IMPORTANT]
-> Queries submitted by Person 2's search function **must be embedded using the exact same model and backend** as the chunks. Vectors from different backends cannot be compared or mixed.
+> [!CAUTION]
+> **CRITICAL VECTOR SPACE WARNING FOR PERSON 2 & PERSON 3**:
+> Even though Google `models/gemini-embedding-001` and `models/gemini-embedding-2` both produce **3072-dimensional** vectors, their coordinate spaces are **completely different, orthogonal, and mathematically incompatible**.
+> - An empirical dot product of identical text across the two models yields ~0.0018 (essentially random noise).
+> - **DO NOT mix chunks embedded under different Gemini model versions in the same index.**
+> - **Person 2's `/ask` query embedder MUST call the EXACT same model version that was used to produce `output/chunks.json`.**
+> 
+> Currently, `output/chunks.json` for Click (764 chunks) and `output/backup_chunks.json` for itsdangerous (82 chunks) are embedded using:
+> **`models/gemini-embedding-2`** (due to Google's 1,000 req/day cap on v1).
+> 
+> When embedding queries in Person 2/3's retrieval service, specify:
+> `"model": "models/gemini-embedding-2"` and `"taskType": "RETRIEVAL_QUERY"`.
 
-| Attribute | Primary Backend (`gemini`) | Local Offline Backend (`local`) |
+| Attribute | Primary Cloud Backend (`gemini`) | Local Offline Backend (`local`) |
 |---|---|---|
-| **Model** | Google `models/gemini-embedding-001` | `sentence-transformers/all-MiniLM-L6-v2` |
+| **Active Model** | Google **`models/gemini-embedding-2`** (fallback from `001`) | `sentence-transformers/all-MiniLM-L6-v2` |
 | **Vector Dimension** | **3072** | **384** |
 | **Active File** | `output/chunks.json` | `output/chunks_local.json` |
-| **Query Embedding** | Call Gemini API with `taskType="RETRIEVAL_QUERY"` | Call `model.encode(query)` |
+| **Query Embedding** | `batchEmbedContents` with `model="models/gemini-embedding-2"`, `taskType="RETRIEVAL_QUERY"` | Call `model.encode(query)` |
 
 ---
 
