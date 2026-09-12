@@ -17,16 +17,15 @@ from chunker import Chunk
 
 logger = logging.getLogger(__name__)
 
-_GEMINI_BATCH_EMBED_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-embedding-001:batchEmbedContents"
-)
+_DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
+_FALLBACK_GEMINI_MODEL = "models/gemini-embedding-2"
 
 
 def _embed_gemini(texts: List[str], api_key: str, batch_size: int = 20) -> List[List[float]]:
     """
     Embed texts using the Gemini batchEmbedContents REST endpoint in batches.
-    Handles rate-limiting (429) with exponential back-off up to 30s.
+    Handles rate-limiting (429) with exponential back-off and automatic fallback
+    to gemini-embedding-2 (3072-dim) if the 1000/day free-tier quota is reached.
     """
     import requests
     import urllib3
@@ -36,11 +35,36 @@ def _embed_gemini(texts: List[str], api_key: str, batch_size: int = 20) -> List[
     session.verify = False  # captive portal injects self-signed cert on this network
     embeddings: List[List[float]] = []
 
+    model = _DEFAULT_GEMINI_MODEL
+
+    # Probe model up front for daily quota exhaustion
+    probe_url = f"https://generativelanguage.googleapis.com/v1beta/{model}:batchEmbedContents"
+    probe_payload = {
+        "requests": [{
+            "model": model,
+            "content": {"parts": [{"text": "probe"}]},
+            "taskType": "RETRIEVAL_DOCUMENT",
+        }]
+    }
+    try:
+        pr = session.post(probe_url, params={"key": api_key}, json=probe_payload, timeout=10)
+        if pr.status_code == 429 and ("PerDay" in pr.text or "daily" in pr.text.lower() or "limit: 1000" in pr.text):
+            logger.warning(
+                "Gemini '%s' daily quota limit reached. Falling back to '%s' (3072-dim).",
+                model, _FALLBACK_GEMINI_MODEL,
+            )
+            model = _FALLBACK_GEMINI_MODEL
+    except Exception as exc:
+        logger.debug("Quota probe failed: %s; proceeding with %s", exc, model)
+
+    embed_url = f"https://generativelanguage.googleapis.com/v1beta/{model}:batchEmbedContents"
+    logger.info("Using Gemini embedding model: %s (dim=3072, batch_size=%d)", model, batch_size)
+
     for start in range(0, len(texts), batch_size):
         batch = texts[start : start + batch_size]
         requests_payload = [
             {
-                "model": "models/gemini-embedding-001",
+                "model": model,
                 "content": {"parts": [{"text": t}]},
                 "taskType": "RETRIEVAL_DOCUMENT",
             }
@@ -51,13 +75,36 @@ def _embed_gemini(texts: List[str], api_key: str, batch_size: int = 20) -> List[
         for attempt in range(8):
             try:
                 resp = session.post(
-                    _GEMINI_BATCH_EMBED_URL,
+                    embed_url,
                     params={"key": api_key},
                     json=payload,
                     timeout=60,
                 )
                 if resp.status_code == 429:
+                    err_text = resp.text
+                    # If daily quota limit hit mid-run on primary model, switch to fallback
+                    if model != _FALLBACK_GEMINI_MODEL and ("PerDay" in err_text or "limit: 1000" in err_text):
+                        logger.warning(
+                            "Gemini '%s' daily quota exhausted mid-run. Switching to '%s' (3072-dim).",
+                            model, _FALLBACK_GEMINI_MODEL,
+                        )
+                        model = _FALLBACK_GEMINI_MODEL
+                        embed_url = f"https://generativelanguage.googleapis.com/v1beta/{model}:batchEmbedContents"
+                        for r_item in requests_payload:
+                            r_item["model"] = model
+                        continue
+
+                    # Try to parse recommended retry delay from Google API response
                     wait = min(60, (2 ** attempt) * 2 + 5)
+                    try:
+                        err_json = resp.json()
+                        for detail in err_json.get("error", {}).get("details", []):
+                            delay_str = detail.get("retryDelay", "")
+                            if delay_str.endswith("s"):
+                                wait = max(wait, int(float(delay_str[:-1])) + 1)
+                    except Exception:
+                        pass
+
                     logger.warning(
                         "Gemini rate limit (429) on batch [%d:%d], attempt %d/8 — sleeping %ds for quota recovery",
                         start, start + len(batch), attempt + 1, wait,
@@ -83,8 +130,8 @@ def _embed_gemini(texts: List[str], api_key: str, batch_size: int = 20) -> List[
             logger.error("All retries failed for batch [%d:%d]; inserting empty vectors.", start, start + len(batch))
             embeddings.extend([[] for _ in batch])
 
-        # Small politeness delay between batches to respect RPM limits
-        time.sleep(0.5)
+        # Small delay between batches to respect burst/RPM limits
+        time.sleep(1.0)
 
     return embeddings
 

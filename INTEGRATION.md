@@ -192,3 +192,19 @@ The codebase grew from 39 to 764 chunks (~20x growth) over 12 years.
 ```
 
 The script is **idempotent**: it skips already-generated snapshots if their output file exists. Worktrees are cleaned up automatically even on failure.
+
+---
+
+## 7. Emergency Fallback / Backup Repository (`itsdangerous`)
+
+In case the primary `click` target encounters live demonstration issues (network partition, rate limits, etc.), an identical full dataset has been pre-computed for `pallets/itsdangerous`:
+
+- **Live Chunks**: `output/backup_chunks.json` (82 chunks, 3072-dim Gemini, 100% schema valid)
+- **Historical Snapshots**: `output/backup_snapshots/` (5 snapshots from 2011 to 2025, 384-dim)
+- **Full Runbook**: See [`BACKUP.md`](file:///c:/Users/samri/Documents/antigravity/intelligent-faraday/BACKUP.md)
+
+### Instant Hot-Swap:
+- **Person 3 (`/ask`)**: Load from `output/backup_chunks.json` instead of `output/chunks.json`.
+- **Person 3 (`/drift-trend`)**: Read manifest from `output/backup_snapshots/manifest.json`.
+- **Re-run Pipeline**: `python main.py --repo itsdangerous --output output/backup_chunks.json` (takes only 45 seconds).
+

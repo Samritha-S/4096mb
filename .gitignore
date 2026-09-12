@@ -8,4 +8,7 @@ output/snapshots/*
 nanoGPT/
 click/
 click_snapshots/
+itsdangerous/
+itsdangerous_snapshots/
+test_backup_candidate/
 .DS_Store
