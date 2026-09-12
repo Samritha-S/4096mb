@@ -2,7 +2,10 @@
 __pycache__/
 *.pyc
 .env
-output/
+output/*
+output/snapshots/*
+!output/snapshots/manifest.json
 nanoGPT/
 click/
+click_snapshots/
 .DS_Store

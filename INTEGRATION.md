@@ -94,3 +94,101 @@ def search(query_vector: np.ndarray, top_k: int = 5):
         "text": chunks[i]["text"]
     } for i in top_indices]
 ```
+
+---
+
+## 6. Historical Snapshots (for Person 3's `/drift-trend` endpoint)
+
+A separate pipeline (`historical_snapshots.py`) pre-computes chunk embeddings across 10 evenly-spaced commits in click's full git history (2014 to 2026), producing a time-series dataset for codebase duplication/drift analysis.
+
+### 6.1 Manifest
+
+**Path**: `output/snapshots/manifest.json`
+
+```json
+{
+  "repository": "click",
+  "total_snapshots": 10,
+  "snapshots": [
+    {
+      "commit_hash": "4101de3daf91c6d35b92395a72bf84132ef48f7c",
+      "short_hash":  "4101de3",
+      "date":        "2014-04-24",
+      "message":     "Initial commit",
+      "file_count":  9,
+      "chunk_count": 39,
+      "embedding_backend":   "local",
+      "embedding_dimension": 384,
+      "output_file": "4101de3daf91c6d35b92395a72bf84132ef48f7c_chunks.json"
+    }
+  ]
+}
+```
+
+The `snapshots` array is ordered **oldest to newest**. Each entry provides:
+- `commit_hash` / `short_hash` — full and 7-char git SHA
+- `date` — ISO 8601 commit date (author date)
+- `message` — first line of the commit message
+- `file_count` — source files processed at that commit
+- `chunk_count` — total chunks produced
+- `embedding_backend` — always `"local"` for snapshots (see § 6.3)
+- `embedding_dimension` — always `384` for snapshots
+- `output_file` — filename (not full path) of the per-snapshot chunk file
+
+### 6.2 Per-Snapshot Chunk Files
+
+**Path pattern**: `output/snapshots/<full_commit_hash>_chunks.json`
+
+Each file is a JSON array using the same 5-field schema as `output/chunks.json`:
+
+```json
+[
+  {
+    "text":       "...",
+    "file_path":  "click.py",
+    "start_line": 1,
+    "end_line":   96,
+    "embedding":  [0.0125, -0.0341, "..."]
+  }
+]
+```
+
+> **Note**: Only `manifest.json` is committed to git. The individual `*_chunks.json` files are gitignored (~40 MB total). Person 3 should read them from the local `output/snapshots/` directory after running `historical_snapshots.py`.
+
+### 6.3 Backend Split (Critical for Vector Space Matching)
+
+| Output | Backend | Model | Dimension |
+|---|---|---|---|
+| `output/chunks.json` | `gemini` | `models/gemini-embedding-001` | **3072** |
+| `output/snapshots/*_chunks.json` | `local` | `all-MiniLM-L6-v2` | **384** |
+
+The two vector spaces are **incompatible**. Person 3's `/drift-trend` endpoint should embed queries using the local backend (`sentence-transformers`) when searching snapshot chunks.
+
+### 6.4 Snapshot Growth Timeline
+
+| Commit | Date | Files | Chunks |
+|---|---|---|---|
+| `4101de3` | 2014-04-24 | 9 | 39 |
+| `c42e93c` | 2014-06-01 | 53 | 148 |
+| `c55d7d2` | 2015-11-05 | 60 | 196 |
+| `537cd3c` | 2018-06-13 | 64 | 229 |
+| `7cc7d40` | 2020-05-23 | 63 | 233 |
+| `dcd991d` | 2021-05-07 | 66 | 290 |
+| `58c2d97` | 2023-03-01 | 66 | 313 |
+| `2a20aca` | 2025-03-26 | 76 | 373 |
+| `aaf99a3` | 2026-02-20 | 105 | 545 |
+| `6aabf09` | 2026-09-05 | 142 | **764** |
+
+The codebase grew from 39 to 764 chunks (~20x growth) over 12 years.
+
+### 6.5 Re-generating Snapshots
+
+```powershell
+# Regenerate with defaults (10 snapshots, local backend)
+.venv\Scripts\python historical_snapshots.py --repo click --max-snapshots 10
+
+# Custom step size
+.venv\Scripts\python historical_snapshots.py --repo click --max-snapshots 10 --step 30
+```
+
+The script is **idempotent**: it skips already-generated snapshots if their output file exists. Worktrees are cleaned up automatically even on failure.
