@@ -6,7 +6,11 @@ Owns: Turning stored embeddings into "here are the 5 most relevant chunks for th
 Features:
 - Fast vectorized cosine similarity search (numpy / pure Python fallback)
 - Storage loader for JSON and SQLite formats (agreed with Person 1)
-- Embedding integration (Google Gemini text-embedding-004 / mock embedding fallback)
+- Embedding integration that mirrors Person 1's embedder.py EXACTLY (same env vars,
+  same Gemini model + endpoint, same local sentence-transformers model) so query
+  vectors always land in the same vector space as the stored chunk embeddings in
+  output/chunks.json. Falls back to a deterministic offline pseudo-embedding only
+  when neither real backend is available (dev/testing only -- see warning below).
 - Top-K retrieval returning clean chunks with file paths, line numbers, and similarity scores (ready for Person 3)
 """
 
@@ -14,8 +18,10 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
+import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -33,6 +39,19 @@ try:
 except (ImportError, ModuleNotFoundError):
     HAS_NUMPY = False
     np = None  # type: ignore
+
+# ── Shared config: MUST match Person 1's embedder.py exactly ──────────────────
+# Same env var names as embedder.py, so a single .env controls both sides and
+# they can never silently drift onto different models/vector spaces again.
+_DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
+_FALLBACK_GEMINI_MODEL = "models/gemini-embedding-2"
+_GEMINI_ENDPOINT_TMPL = "https://generativelanguage.googleapis.com/v1beta/{model}:batchEmbedContents"
+
+
+class EmbeddingDimensionMismatch(ValueError):
+    """Raised when a query vector and a stored chunk vector have different
+    dimensionality -- almost always a sign the query was embedded with a
+    different model than the one used to build output/chunks.json."""
 
 
 def _stable_hash(value: str) -> int:
@@ -88,6 +107,13 @@ def _pure_cosine_similarity(query_vec: List[float], doc_vec: List[float]) -> flo
     """Pure Python cosine similarity between two 1D vectors."""
     if not query_vec or not doc_vec:
         return 0.0
+    if len(query_vec) != len(doc_vec):
+        raise EmbeddingDimensionMismatch(
+            f"Query embedding has {len(query_vec)} dims but chunk embedding has "
+            f"{len(doc_vec)} dims. This means the query was embedded with a "
+            f"different model than output/chunks.json was built with -- check "
+            f"GEMINI_EMBEDDING_MODEL / EMBEDDING_BACKEND match Person 1's .env."
+        )
     dot = sum(q * d for q, d in zip(query_vec, doc_vec))
     q_norm = math.sqrt(sum(q * q for q in query_vec))
     d_norm = math.sqrt(sum(d * d for d in doc_vec))
@@ -100,6 +126,8 @@ def cosine_similarity(query_vec: Any, doc_vecs: Any) -> Any:
     """
     Compute cosine similarity between a 1D query vector and doc vectors.
     Supports both Numpy ndarray and pure Python lists.
+    Raises EmbeddingDimensionMismatch if vector lengths don't match, instead
+    of silently truncating (a mismatch is always a real bug, never valid data).
     """
     if HAS_NUMPY and np is not None:
         try:
@@ -107,6 +135,15 @@ def cosine_similarity(query_vec: Any, doc_vecs: Any) -> Any:
             docs = np.array(doc_vecs, dtype=np.float32)
             if docs.ndim == 1:
                 docs = docs.reshape(1, -1)
+
+            if docs.shape[1] != q.shape[0]:
+                raise EmbeddingDimensionMismatch(
+                    f"Query embedding has {q.shape[0]} dims but chunk embeddings "
+                    f"have {docs.shape[1]} dims. This means the query was embedded "
+                    f"with a different model than output/chunks.json was built "
+                    f"with -- check GEMINI_EMBEDDING_MODEL / EMBEDDING_BACKEND "
+                    f"match Person 1's .env."
+                )
 
             query_norm = np.linalg.norm(q)
             if query_norm == 0:
@@ -117,6 +154,8 @@ def cosine_similarity(query_vec: Any, doc_vecs: Any) -> Any:
 
             dot_products = np.dot(docs, q)
             return dot_products / (doc_norms * query_norm)
+        except EmbeddingDimensionMismatch:
+            raise
         except Exception:
             pass
 
@@ -127,36 +166,99 @@ def cosine_similarity(query_vec: Any, doc_vecs: Any) -> Any:
 
 
 class EmbeddingProvider:
-    """Generates embeddings using Google Gemini API or deterministic offline fallback."""
+    """
+    Generates QUERY embeddings using the exact same backend/model Person 1's
+    embedder.py used to generate the DOCUMENT embeddings in output/chunks.json.
 
-    def __init__(self, api_key: Optional[str] = None, model_name: str = "models/text-embedding-004"):
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        self.model_name = model_name
-        self._client = None
-        self._init_client()
+    Backend selection mirrors embedder.py precisely:
+      - EMBEDDING_BACKEND=gemini (default): Gemini REST batchEmbedContents,
+        model from GEMINI_EMBEDDING_MODEL (default "models/gemini-embedding-001"),
+        with the same 429/daily-quota fallback to "models/gemini-embedding-2".
+      - EMBEDDING_BACKEND=local: sentence-transformers "all-MiniLM-L6-v2",
+        the same local model embedder.py uses (384-dim).
 
-    def _init_client(self):
-        if self.api_key:
+    If neither is usable (no API key / requests failure / library not
+    installed), falls back to a deterministic offline pseudo-embedding.
+
+    IMPORTANT: the offline fallback is for isolated dev/testing only. Its
+    vectors are NOT in the same space as real Gemini or MiniLM embeddings, so
+    it must never be used to search real output/chunks.json data -- only
+    against chunks that were also embedded with the same fallback.
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model_name: Optional[str] = None,
+        backend: Optional[str] = None,
+    ):
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
+        self.backend = backend or os.getenv("EMBEDDING_BACKEND", "gemini")
+        # model_name is only used for the "gemini" backend; local backend has
+        # a fixed model to match embedder.py's _embed_local().
+        self.model_name = model_name or _DEFAULT_GEMINI_MODEL
+        self._local_model = None  # lazy-loaded sentence-transformers model
+
+    # ── Gemini backend (mirrors embedder.py's _embed_gemini, single-text) ──
+    def _embed_gemini_query(self, text: str) -> List[float]:
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        session = requests.Session()
+        model = self.model_name
+        payload = {
+            "requests": [{
+                "model": model,
+                "content": {"parts": [{"text": text}]},
+                # Queries use RETRIEVAL_QUERY; Person 1 embeds chunks with
+                # RETRIEVAL_DOCUMENT -- both are required by Gemini's
+                # asymmetric retrieval task types and are expected to differ.
+                "taskType": "RETRIEVAL_QUERY",
+            }]
+        }
+        url = _GEMINI_ENDPOINT_TMPL.format(model=model)
+
+        for attempt in range(5):
             try:
-                # pyrefly: ignore [missing-import]
-                import google.generativeai as genai  # type: ignore
-                genai.configure(api_key=self.api_key)
-                self._client = genai
-            except (ImportError, ModuleNotFoundError, Exception):
-                self._client = None
+                resp = session.post(url, params={"key": self.api_key}, json=payload, timeout=30)
+                if resp.status_code == 429:
+                    err_text = resp.text
+                    if model != _FALLBACK_GEMINI_MODEL and (
+                        "PerDay" in err_text or "limit: 1000" in err_text
+                    ):
+                        model = _FALLBACK_GEMINI_MODEL
+                        url = _GEMINI_ENDPOINT_TMPL.format(model=model)
+                        payload["requests"][0]["model"] = model
+                        continue
+                    time.sleep(min(30, (2 ** attempt) * 2 + 2))
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                return data["embeddings"][0]["values"]
+            except Exception:
+                if attempt == 4:
+                    raise
+                time.sleep(min(15, 2 ** attempt))
+        raise RuntimeError("Gemini query embedding failed after retries")
+
+    # ── Local backend (mirrors embedder.py's _embed_local exactly) ─────────
+    def _embed_local_query(self, text: str) -> List[float]:
+        if self._local_model is None:
+            from sentence_transformers import SentenceTransformer
+            self._local_model = SentenceTransformer("all-MiniLM-L6-v2")
+        vec = self._local_model.encode([text], show_progress_bar=False, convert_to_numpy=True)[0]
+        return vec.tolist()
 
     def embed_text(self, text: str) -> List[float]:
-        """Generate embedding vector for a single string."""
-        if self._client:
-            try:
-                result = self._client.embed_content(
-                    model=self.model_name,
-                    content=text,
-                    task_type="retrieval_query"
-                )
-                return result["embedding"]
-            except Exception:
-                pass
+        """Generate embedding vector for a single string (a search query)."""
+        try:
+            if self.backend == "gemini" and self.api_key:
+                return self._embed_gemini_query(text)
+            if self.backend == "local":
+                return self._embed_local_query(text)
+        except Exception:
+            pass  # fall through to offline dev fallback below
 
         return self._generate_deterministic_embedding(text)
 
@@ -165,19 +267,27 @@ class EmbeddingProvider:
         return [self.embed_text(t) for t in texts]
 
     @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        """
+        Splits code/text into lowercase word tokens, stripping punctuation and
+        splitting snake_case/camelCase so identifiers like DATABASE_URL become
+        independently matchable tokens ("database", "url"). Only used by the
+        offline dev fallback below.
+        """
+        raw = re.sub(r"[^0-9a-zA-Z]+", " ", text)
+        raw = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", raw)
+        return [w for w in raw.lower().split() if w]
+
+    @staticmethod
     def _generate_deterministic_embedding(text: str, dim: int = 128) -> List[float]:
         """
-        Deterministic pseudo-embedding for offline development and testing.
-        Uses character n-grams and hashing to produce consistent similarity for
-        semantic overlap. Uses a stable hash (hashlib-based) rather than the
-        builtin hash(), so results are reproducible across separate Python
-        processes/runs -- important if embeddings are ever persisted to disk
-        and reloaded later (e.g. via StorageLoader.save_to_json /
-        save_to_sqlite) and compared against embeddings computed in a fresh
-        process.
+        Deterministic pseudo-embedding for offline development and testing
+        ONLY -- not compatible with real Gemini or MiniLM vectors of any
+        dimension. Uses a stable (hashlib-based) hash so results are
+        reproducible across separate Python processes/runs.
         """
         vec = [0.0] * dim
-        words = text.lower().split()
+        words = EmbeddingProvider._tokenize(text)
         if not words:
             return vec
 
@@ -187,7 +297,6 @@ class EmbeddingProvider:
             sign = 1.0 if (h // dim) % 2 == 0 else -1.0
             vec[idx] += sign
 
-            # 2-grams for subword similarity
             for i in range(len(word) - 1):
                 bg_hash = _stable_hash(word[i:i+2])
                 bg_idx = bg_hash % dim
